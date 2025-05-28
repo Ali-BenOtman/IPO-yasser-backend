@@ -163,6 +163,7 @@ class RiskAnalysisCreate(BaseModel):
     ipoPredictionId: str
     additionalInfo: Optional[str] = Field(None, max_length=5000)
     uploadPdf: Optional[bool] = False
+    riskFactorsText: Optional[str] = Field(None, min_length=50, max_length=10000, description="Risk factors text for AI analysis")
 
 class RiskAnalysisUpdate(BaseModel):
     additionalInfo: Optional[str] = Field(None, max_length=5000)
@@ -172,8 +173,9 @@ class RiskAnalysisUpdate(BaseModel):
     pdfFileSize: Optional[int] = None
     riskLevel: Optional[str] = None
     riskScore: Optional[float] = None
-    riskFactors: Optional[str] = None
+    riskFactors: Optional[str] = Field(None, description="JSON string containing AI analysis results")
     analysisStatus: Optional[str] = None
+    riskFactorsText: Optional[str] = Field(None, min_length=50, max_length=10000, description="Input text for AI analysis")
 
 class RiskAnalysisResponse(BaseModel):
     id: str = Field(..., alias="$id")
@@ -186,8 +188,9 @@ class RiskAnalysisResponse(BaseModel):
     pdfFileSize: Optional[int] = None
     riskLevel: Optional[str] = None
     riskScore: Optional[float] = None
-    riskFactors: Optional[str] = None
+    riskFactors: Optional[str] = Field(None, description="JSON string containing AI analysis results")
     analysisStatus: Optional[str] = None
+    riskFactorsText: Optional[str] = Field(None, description="Input text for AI analysis")
     createdAt: Optional[datetime] = None
     updatedAt: Optional[datetime] = None
     analyzedAt: Optional[datetime] = None
@@ -266,6 +269,7 @@ class MultiStepFormData(BaseModel):
     # Step 3: Risk Analysis
     additionalInfo: Optional[str] = None
     uploadPdf: Optional[bool] = False
+    riskFactorsText: Optional[str] = Field(None, min_length=50, max_length=10000, description="Risk factors text for AI analysis")
 
 # Response Models
 class UsersListResponse(BaseModel):
@@ -294,6 +298,14 @@ class AIServicePredictionResponse(BaseModel):
     predictions: List[dict]
     model_used: str
     timestamp: str
+
+# Risk Analysis Request Model
+class RiskAnalysisRequest(BaseModel):
+    """Model for standalone risk analysis requests"""
+    risk_text: str = Field(..., min_length=50, max_length=10000, description="Risk factors text for AI analysis")
+    company_name: Optional[str] = Field(None, description="Company name for context")
+    user_id: Optional[str] = Field(None, description="User ID for database storage")
+    prediction_id: Optional[str] = Field(None, description="Prediction ID for linking")
 
 # Complete IPO Analysis Response
 class CompleteIPOAnalysisResponse(BaseModel):

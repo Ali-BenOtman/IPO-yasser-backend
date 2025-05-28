@@ -1,11 +1,14 @@
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from pydantic import Field
+import json
+from datetime import datetime
 from ..models.ipo_models import (
     UserCreate, UserUpdate, UserResponse, UsersListResponse,
     IPOPredictionCreate, IPOPredictionUpdate, IPOPredictionResponse, IPOPredictionsListResponse,
     RiskAnalysisCreate, RiskAnalysisUpdate, RiskAnalysisResponse, RiskAnalysisListResponse,
     PredictionHistoryResponse, PredictionHistoryListResponse,
-    MultiStepFormData, CompleteIPOAnalysisResponse
+    MultiStepFormData, CompleteIPOAnalysisResponse, RiskAnalysisRequest
 )
 from ..services.ipo_service import (
     UserService, IPOPredictionService, RiskAnalysisService, 
@@ -284,6 +287,102 @@ async def get_risk_analysis_by_prediction(prediction_id: str):
     except Exception as e:
         if "not found" in str(e).lower():
             raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/analyze-risk-factors", response_model=dict)
+async def analyze_risk_factors_standalone(request: RiskAnalysisRequest):
+    """Standalone risk factor analysis endpoint"""
+    try:
+        # Request AI risk analysis
+        ai_risk_result = await RiskAnalysisService.request_ai_risk_analysis(
+            risk_text=request.risk_text,
+            company_name=request.company_name
+        )
+        
+        # If user_id and prediction_id are provided, store in database
+        risk_analysis_id = None
+        if request.user_id and request.prediction_id:
+            try:
+                # Store AI results in existing fields as compact JSON (max 2000 chars)
+                try:
+                    # Create very compact summary for database storage
+                    compact_summary = {
+                        "score": ai_risk_result.get("risk_score", 50),
+                        "level": ai_risk_result.get("risk_level", "Moderate Risk"),
+                        "breakdown": ai_risk_result.get("score_breakdown", {}),
+                        "concerns": [c[:80] for c in ai_risk_result.get("critical_concerns", [])[:3]],  # Truncate concerns
+                        "model": "gpt-4o-mini",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+                    }
+                    
+                    # Convert to JSON and ensure it fits in database (max 1900 chars to be safe)
+                    compact_json = json.dumps(compact_summary, separators=(',', ':'))  # Compact JSON
+                    if len(compact_json) > 1900:
+                        # Further reduce if still too long
+                        compact_summary = {
+                            "score": ai_risk_result.get("risk_score", 50),
+                            "level": ai_risk_result.get("risk_level", "Moderate"),
+                            "model": "ai",
+                            "timestamp": datetime.now().strftime("%Y-%m-%d")
+                        }
+                        compact_json = json.dumps(compact_summary, separators=(',', ':'))
+                
+                    risk_data = {
+                        "userId": request.user_id,
+                        "ipoPredictionId": request.prediction_id,
+                        "riskScore": ai_risk_result.get("risk_score", 50),
+                        "riskLevel": ai_risk_result.get("risk_level", "Moderate Risk"),
+                        "riskFactors": compact_json,  # Store compact JSON
+                        "analysisStatus": "completed",
+                        "riskFactorsText": request.risk_text,
+                        "additionalInfo": "",
+                        "uploadPdf": False,
+                        "analyzedAt": datetime.now().isoformat()
+                    }
+                    
+                except Exception as json_error:
+                    print(f"Failed to create compact JSON: {str(json_error)}")
+                    # Fallback to minimal data
+                    minimal_data = {
+                        "score": ai_risk_result.get("risk_score", 50),
+                        "status": "completed"
+                    }
+                    risk_data = {
+                        "userId": request.user_id,
+                        "ipoPredictionId": request.prediction_id,
+                        "riskScore": ai_risk_result.get("risk_score", 50),
+                        "riskLevel": ai_risk_result.get("risk_level", "Moderate Risk"),
+                        "riskFactors": json.dumps(minimal_data),
+                        "analysisStatus": "completed",
+                        "riskFactorsText": request.risk_text,
+                        "additionalInfo": "",
+                        "uploadPdf": False,
+                        "analyzedAt": datetime.now().isoformat()
+                    }
+                
+                risk_analysis_id = await RiskAnalysisService.create_risk_analysis(risk_data)
+                print(f"Risk analysis stored with ID: {risk_analysis_id}")
+                
+            except Exception as e:
+                print(f"Failed to store risk analysis: {str(e)}")
+                # Continue without storing - still return the analysis
+        
+        return {
+            "success": ai_risk_result.get("success", False),
+            "risk_analysis": {
+                "risk_score": ai_risk_result.get("risk_score"),
+                "risk_level": ai_risk_result.get("risk_level"),
+                "analysis_summary": ai_risk_result.get("analysis_summary"),
+                "score_breakdown": ai_risk_result.get("score_breakdown"),
+                "critical_concerns": ai_risk_result.get("critical_concerns"),
+                "timestamp": ai_risk_result.get("timestamp")
+            },
+            "stored_analysis_id": risk_analysis_id,
+            "fallback_used": ai_risk_result.get("fallback_used", False),
+            "error": ai_risk_result.get("error") if not ai_risk_result.get("success") else None
+        }
+        
+    except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 # Prediction History Routes

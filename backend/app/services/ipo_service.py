@@ -442,6 +442,77 @@ class RiskAnalysisService:
         except AppwriteException as e:
             raise Exception(f"Failed to update risk analysis: {str(e)}")
 
+    @staticmethod
+    async def request_ai_risk_analysis(risk_text: str, company_name: Optional[str] = None) -> dict:
+        """Request AI-powered risk factor analysis"""
+        try:
+            request_data = {
+                "samples": [
+                    {
+                        "risk_text": risk_text,
+                        "company_name": company_name or "Unknown Company"
+                    }
+                ]
+            }
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    f"{AI_SERVICE_URL}/analyze/risk-factors",
+                    json=request_data,
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result and len(result) > 0:
+                        analysis_result = result[0]  # Get first result from batch
+                        return {
+                            "success": True,
+                            "risk_score": analysis_result.get("risk_score"),
+                            "risk_level": analysis_result.get("risk_level"),
+                            "score_breakdown": json.dumps(analysis_result.get("score_breakdown", {})),
+                            "critical_concerns": json.dumps(analysis_result.get("critical_concerns", [])),
+                            "analysis_summary": analysis_result.get("analysis_summary"),
+                            "model_used": "openai_gpt4",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    else:
+                        raise Exception("Empty response from AI service")
+                elif response.status_code == 503:
+                    # Service unavailable - risk analysis not configured
+                    return {
+                        "success": False,
+                        "error": "Risk analysis service not available",
+                        "fallback_used": True,
+                        "risk_score": 50.0,
+                        "risk_level": "Moderate Risk",
+                        "analysis_summary": "Risk analysis service is not currently available. Manual review recommended."
+                    }
+                else:
+                    raise Exception(f"AI service error: {response.status_code} - {response.text}")
+                    
+        except httpx.RequestError as e:
+            print(f"Request error to AI service: {str(e)}")
+            # Return fallback response
+            return {
+                "success": False,
+                "error": f"Failed to connect to AI service: {str(e)}",
+                "fallback_used": True,
+                "risk_score": 60.0,
+                "risk_level": "Moderate Risk",
+                "analysis_summary": "Risk analysis service is temporarily unavailable. Manual review recommended."
+            }
+        except Exception as e:
+            print(f"Error in AI risk analysis: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "fallback_used": True,
+                "risk_score": 70.0,
+                "risk_level": "High Risk",
+                "analysis_summary": f"Risk analysis failed: {str(e)}. Manual review recommended."
+            }
+
 
 class PredictionHistoryService:
     @staticmethod
@@ -549,15 +620,97 @@ class IPOWorkflowService:
 
             # Step 4: Create risk analysis if provided
             risk_analysis = None
-            if form_data.additionalInfo or form_data.uploadPdf:
+            if form_data.additionalInfo or form_data.uploadPdf or form_data.riskFactorsText:
                 risk_data = {
                     "userId": user["$id"],
                     "ipoPredictionId": prediction["$id"],
                     "additionalInfo": form_data.additionalInfo,
                     "uploadPdf": form_data.uploadPdf or False,
+                    "riskFactorsText": form_data.riskFactorsText,
                     "analysisStatus": "pending"
                 }
                 risk_analysis = await RiskAnalysisService.create_risk_analysis(risk_data)
+                
+                # If risk factors text is provided, request AI analysis
+                if form_data.riskFactorsText:
+                    try:
+                        ai_risk_result = await RiskAnalysisService.request_ai_risk_analysis(
+                            risk_text=form_data.riskFactorsText,
+                            company_name=form_data.companyName
+                        )
+                        
+                        # Update risk analysis with AI results
+                        # Store AI results in existing fields as compact JSON (max 2000 chars)
+                        try:
+                            # Create very compact summary for database storage
+                            compact_summary = {
+                                "score": ai_risk_result.get("risk_score", 50),
+                                "level": ai_risk_result.get("risk_level", "Moderate Risk"),
+                                "breakdown": ai_risk_result.get("score_breakdown", {}),
+                                "concerns": [c[:80] for c in ai_risk_result.get("critical_concerns", [])[:3]],  # Truncate concerns
+                                "model": "gpt-4o-mini",
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+                            }
+                            
+                            # Convert to JSON and ensure it fits in database (max 1900 chars to be safe)
+                            compact_json = json.dumps(compact_summary, separators=(',', ':'))  # Compact JSON
+                            if len(compact_json) > 1900:
+                                # Further reduce if still too long
+                                compact_summary = {
+                                    "score": ai_risk_result.get("risk_score", 50),
+                                    "level": ai_risk_result.get("risk_level", "Moderate"),
+                                    "model": "ai",
+                                    "timestamp": datetime.now().strftime("%Y-%m-%d")
+                                }
+                                compact_json = json.dumps(compact_summary, separators=(',', ':'))
+                            
+                            risk_update_data = {
+                                "riskScore": ai_risk_result.get("risk_score", 50),
+                                "riskLevel": ai_risk_result.get("risk_level", "Moderate Risk"),
+                                "riskFactors": compact_json,  # Store compact JSON
+                                "analysisStatus": "completed",
+                                "analyzedAt": datetime.now().isoformat()
+                            }
+                            
+                            print(f"Updating risk analysis with compact data: {len(compact_json)} chars")
+                            await RiskAnalysisService.update_risk_analysis(risk_analysis["$id"], risk_update_data)
+                            
+                            # Fetch the updated risk analysis to return in response
+                            risk_analysis = await RiskAnalysisService.get_risk_analysis(risk_analysis["$id"])
+                            
+                        except Exception as json_error:
+                            print(f"Failed to create compact JSON: {str(json_error)}")
+                            # Fallback to minimal data
+                            minimal_data = {
+                                "score": ai_risk_result.get("risk_score", 50),
+                                "status": "completed"
+                            }
+                            risk_update_data = {
+                                "riskScore": ai_risk_result.get("risk_score", 50),
+                                "riskLevel": ai_risk_result.get("risk_level", "Moderate Risk"),
+                                "riskFactors": json.dumps(minimal_data),
+                                "analysisStatus": "completed",
+                                "analyzedAt": datetime.now().isoformat()
+                            }
+                            await RiskAnalysisService.update_risk_analysis(risk_analysis["$id"], risk_update_data)
+                            
+                            # Fetch the updated risk analysis to return in response
+                            risk_analysis = await RiskAnalysisService.get_risk_analysis(risk_analysis["$id"])
+
+                    except Exception as e:
+                        print(f"AI risk analysis failed: {str(e)}")
+                        # Update status to failed but keep the analysis record
+                        error_json = {
+                            "error_message": f"Risk analysis failed: {str(e)}",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        await RiskAnalysisService.update_risk_analysis(risk_analysis["$id"], {
+                            "analysisStatus": "failed",
+                            "riskFactors": json.dumps(error_json)
+                        })
+                        
+                        # Fetch the updated risk analysis to return in response
+                        risk_analysis = await RiskAnalysisService.get_risk_analysis(risk_analysis["$id"])
 
             # Get prediction history
             history_result = await PredictionHistoryService.get_user_history(user["$id"])
@@ -632,15 +785,97 @@ class IPOWorkflowService:
 
             # Step 6: Create risk analysis if provided
             risk_analysis = None
-            if form_data.additionalInfo or form_data.uploadPdf:
+            if form_data.additionalInfo or form_data.uploadPdf or form_data.riskFactorsText:
                 risk_data = {
                     "userId": user["$id"],
                     "ipoPredictionId": prediction["$id"],
                     "additionalInfo": form_data.additionalInfo,
                     "uploadPdf": form_data.uploadPdf or False,
-                    "analysisStatus": "completed"  # Mark as completed for immediate processing
+                    "riskFactorsText": form_data.riskFactorsText,
+                    "analysisStatus": "pending"
                 }
                 risk_analysis = await RiskAnalysisService.create_risk_analysis(risk_data)
+                
+                # If risk factors text is provided, request AI analysis
+                if form_data.riskFactorsText:
+                    try:
+                        ai_risk_result = await RiskAnalysisService.request_ai_risk_analysis(
+                            risk_text=form_data.riskFactorsText,
+                            company_name=form_data.companyName
+                        )
+                        
+                        # Update risk analysis with AI results
+                        # Store AI results in existing fields as compact JSON (max 2000 chars)
+                        try:
+                            # Create very compact summary for database storage
+                            compact_summary = {
+                                "score": ai_risk_result.get("risk_score", 50),
+                                "level": ai_risk_result.get("risk_level", "Moderate Risk"),
+                                "breakdown": ai_risk_result.get("score_breakdown", {}),
+                                "concerns": [c[:80] for c in ai_risk_result.get("critical_concerns", [])[:3]],  # Truncate concerns
+                                "model": "gpt-4o-mini",
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+                            }
+                            
+                            # Convert to JSON and ensure it fits in database (max 1900 chars to be safe)
+                            compact_json = json.dumps(compact_summary, separators=(',', ':'))  # Compact JSON
+                            if len(compact_json) > 1900:
+                                # Further reduce if still too long
+                                compact_summary = {
+                                    "score": ai_risk_result.get("risk_score", 50),
+                                    "level": ai_risk_result.get("risk_level", "Moderate"),
+                                    "model": "ai",
+                                    "timestamp": datetime.now().strftime("%Y-%m-%d")
+                                }
+                                compact_json = json.dumps(compact_summary, separators=(',', ':'))
+                            
+                            risk_update_data = {
+                                "riskScore": ai_risk_result.get("risk_score", 50),
+                                "riskLevel": ai_risk_result.get("risk_level", "Moderate Risk"),
+                                "riskFactors": compact_json,  # Store compact JSON
+                                "analysisStatus": "completed",
+                                "analyzedAt": datetime.now().isoformat()
+                            }
+                            
+                            print(f"Updating risk analysis with compact data: {len(compact_json)} chars")
+                            await RiskAnalysisService.update_risk_analysis(risk_analysis["$id"], risk_update_data)
+                            
+                            # Fetch the updated risk analysis to return in response
+                            risk_analysis = await RiskAnalysisService.get_risk_analysis(risk_analysis["$id"])
+                            
+                        except Exception as json_error:
+                            print(f"Failed to create compact JSON: {str(json_error)}")
+                            # Fallback to minimal data
+                            minimal_data = {
+                                "score": ai_risk_result.get("risk_score", 50),
+                                "status": "completed"
+                            }
+                            risk_update_data = {
+                                "riskScore": ai_risk_result.get("risk_score", 50),
+                                "riskLevel": ai_risk_result.get("risk_level", "Moderate Risk"),
+                                "riskFactors": json.dumps(minimal_data),
+                                "analysisStatus": "completed",
+                                "analyzedAt": datetime.now().isoformat()
+                            }
+                            await RiskAnalysisService.update_risk_analysis(risk_analysis["$id"], risk_update_data)
+                            
+                            # Fetch the updated risk analysis to return in response
+                            risk_analysis = await RiskAnalysisService.get_risk_analysis(risk_analysis["$id"])
+
+                    except Exception as e:
+                        print(f"AI risk analysis failed: {str(e)}")
+                        # Update status to failed but keep the analysis record
+                        error_json = {
+                            "error_message": f"Risk analysis failed: {str(e)}",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        await RiskAnalysisService.update_risk_analysis(risk_analysis["$id"], {
+                            "analysisStatus": "failed",
+                            "riskFactors": json.dumps(error_json)
+                        })
+                        
+                        # Fetch the updated risk analysis to return in response
+                        risk_analysis = await RiskAnalysisService.get_risk_analysis(risk_analysis["$id"])
 
             # Step 7: Get updated prediction history
             history_result = await PredictionHistoryService.get_user_history(user["$id"])
