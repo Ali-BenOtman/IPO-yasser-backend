@@ -1,3 +1,4 @@
+import os
 from appwrite.client import Client
 from appwrite.services.users import Users
 from appwrite.services.databases import Databases
@@ -21,4 +22,17 @@ databases_service = Databases(client)
 company_config = {
     "database_id": config["appwrite"].get("database_id", ""),
     "collection_id": config["appwrite"].get("collection_id", "company")
-} 
+}
+
+# Helper functions for the new IPO service
+def get_client() -> Client:
+    """Get the Appwrite client instance"""
+    return client
+
+def get_databases() -> Databases:
+    """Get the Appwrite databases service instance"""
+    return databases_service
+
+def get_users() -> Users:
+    """Get the Appwrite users service instance"""
+    return users_service 
